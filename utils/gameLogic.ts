@@ -79,22 +79,48 @@ export const distributeCards = (players: Player[]): Player[] => {
   return playersWithCards;
 };
 
-export const checkWinCondition = (players: Player[]): 'WITCH_WIN' | 'TOWN_WIN' | null => {
+export const checkWinCondition = (players: Player[], isSmallGameMode: boolean = false): 'WITCH_WIN' | 'TOWN_WIN' | null => {
+  if (isSmallGameMode) {
+    // Small game mode (2-3 players with ghosts)
+    // Town wins: The single witch card is revealed
+    const witchCard = players.flatMap(p => p.cards).find(c => c.type === CardType.WITCH);
+    if (witchCard?.isRevealed) {
+      return 'TOWN_WIN';
+    }
+
+    // Witches win: Any entity is eliminated (all their cards are revealed)
+    const anyEliminated = players.some(p =>
+      p.cards.length > 0 && p.cards.every(c => c.isRevealed)
+    );
+    if (anyEliminated) {
+      return 'WITCH_WIN';
+    }
+
+    // Witches win: All real players (non-ghosts) are witches
+    const realPlayers = players.filter(p => !p.isGhost);
+    const allRealPlayersAreWitches = realPlayers.length > 0 && realPlayers.every(p => p.hasRevealedWitch);
+    if (allRealPlayersAreWitches) {
+      return 'WITCH_WIN';
+    }
+
+    return null;
+  }
+
+  // Standard mode (4+ players)
   const alivePlayers = players.filter(p => !p.isDead);
   const activeWitchCards = alivePlayers.flatMap(p => p.cards).filter(c => c.type === CardType.WITCH && !c.isRevealed);
-  const witchTeam = players.filter(p => p.hasRevealedWitch && !p.isDead);
-  
+
   // All witch cards revealed -> Town Wins
   if (activeWitchCards.length === 0) {
     return 'TOWN_WIN';
   }
 
   // Witches kill enough townies
-  // If remaining players are equal to remaining witch team, witches usually can't be voted out easily, 
+  // If remaining players are equal to remaining witch team, witches usually can't be voted out easily,
   // but strictly rules say: Town wins if all Witches dead. Witch wins if all Town dead.
   // We will stick to: Game ends when all Witch cards revealed (Town Win)
   // Or if only Witch team is alive (Witch Win).
-  
+
   const townTeamAlive = alivePlayers.filter(p => !p.hasRevealedWitch);
   if (townTeamAlive.length === 0) {
     return 'WITCH_WIN';

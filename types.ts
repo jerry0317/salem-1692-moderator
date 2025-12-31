@@ -21,6 +21,7 @@ export interface Player {
   hasRevealedWitch: boolean; // True if they have ever held a witch card
   immune: boolean; // Immune from night kill (confession)
   isDisconnected?: boolean; // True if player has disconnected but may rejoin
+  isGhost?: boolean; // True for ghost entities in 2-3 player mode
 }
 
 export enum GamePhase {
@@ -32,6 +33,7 @@ export enum GamePhase {
   NIGHT_WITCH_VOTE = 'NIGHT_WITCH_VOTE',
   NIGHT_CONSTABLE = 'NIGHT_CONSTABLE',
   NIGHT_CONFESSION = 'NIGHT_CONFESSION',
+  NIGHT_RESOLUTION = 'NIGHT_RESOLUTION',  // After confessions end, show who was targeted
   GAME_OVER = 'GAME_OVER',
 }
 
@@ -61,6 +63,13 @@ export interface PendingAccusation {
   accepted: boolean;  // Target has accepted the accusation
 }
 
+// For 2-3 player mode: track card selection during night damage
+export interface NightDamageSelection {
+  targetId: string;     // Entity being damaged
+  chooserId: string;    // Left neighbor who chooses which cards to reveal
+  pendingReveal: boolean; // True when waiting for card selection
+}
+
 export interface GameState {
   roomId: string;
   phase: GamePhase;
@@ -74,6 +83,8 @@ export interface GameState {
   conspiracySelections: ConspiracySelection[];  // Track card selections during conspiracy
   nightConfirmations: string[];  // Track player IDs who have confirmed during night phase
   fakeVotes: Record<string, number>;  // Track fake votes for fun stats (playerId -> vote count)
+  isSmallGameMode?: boolean;  // True for 2-3 player games with ghosts
+  nightDamageSelection?: NightDamageSelection | null;  // For 2-3 player partial night damage
 }
 
 // Network Payloads
@@ -87,4 +98,4 @@ export type NetworkMessage =
   | { type: 'LEAVE'; payload: { playerId: string } }
   | { type: 'ERROR'; payload: { message: string } };
 
-export const MIN_PLAYERS = 4;
+export const MIN_PLAYERS = 2;

@@ -15,5 +15,6 @@ export const PHASE_TITLES: Record<string, string> = {
   NIGHT_WITCH_VOTE: "Night: Witch's Hour",
   NIGHT_CONSTABLE: "Night: Constable's Watch",
   NIGHT_CONFESSION: "Night: Confessions",
+  NIGHT_RESOLUTION: "Night: Resolution",
   GAME_OVER: "Game Over",
 };

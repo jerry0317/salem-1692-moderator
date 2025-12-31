@@ -24,7 +24,7 @@ dist-ssr
 *.sw?
 
 # Rulebook
-rulebook.pdf
+rulebook*.pdf
 
 # Claude Code
 .claude

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   GameState, Player, GamePhase, NetworkMessage,
-  MIN_PLAYERS, Card, CardType, ConspiracySelection
+  MIN_PLAYERS, Card, CardType, ConspiracySelection, NightDamageSelection
 } from './types';
 import { PeerService } from './services/peerService';
 import { distributeCards, checkWinCondition, shuffle } from './utils/gameLogic';
@@ -25,6 +25,7 @@ const INITIAL_STATE: GameState = {
   conspiracySelections: [],
   nightConfirmations: [],
   fakeVotes: {},
+  nightDamageSelection: null,
 };
 
 // Historical Salem facts for "Did you know?" display during night phases
@@ -163,6 +164,15 @@ const getRandomMessage = (messages: string[], name: string) => {
   return template.replace('{name}', name);
 };
 
+// Get left neighbor of a player (previous in array order, wrapping around)
+const getLeftNeighborId = (players: Player[], playerId: string): string | null => {
+  const aliveEntities = players.filter(p => !p.isDead);
+  const index = aliveEntities.findIndex(p => p.id === playerId);
+  if (index === -1) return null;
+  const leftIndex = index === 0 ? aliveEntities.length - 1 : index - 1;
+  return aliveEntities[leftIndex]?.id || null;
+};
+
 const App: React.FC = () => {
   const [gameState, setGameState] = useState<GameState>(INITIAL_STATE);
   const [peerService, setPeerService] = useState<PeerService | null>(null);
@@ -178,10 +188,11 @@ const App: React.FC = () => {
   const [hostDisconnected, setHostDisconnected] = useState(false);
   const [isRejoining, setIsRejoining] = useState(false);
   const [conspiracyModal, setConspiracyModal] = useState(false);
-  const [nightResolutionModal, setNightResolutionModal] = useState(false);
   const [showMyHand, setShowMyHand] = useState(false);
   const [currentDisplayFact, setCurrentDisplayFact] = useState('');
   const [showConfetti, setShowConfetti] = useState(false);
+  const [nightDamageSelectedCards, setNightDamageSelectedCards] = useState<string[]>([]);
+  const [ghostPeekModal, setGhostPeekModal] = useState<{ ghostId: string; card: Card } | null>(null);
 
   // Refresh the "Did you know?" fact when phase changes - compute once and store
   useEffect(() => {
@@ -583,18 +594,70 @@ const App: React.FC = () => {
 
   // --- HOST ACTIONS ---
 
+  // Move player up or down in the player list (affects seating order)
+  const movePlayer = (index: number, direction: 'up' | 'down') => {
+    if (!isHost) return;
+    const newIndex = direction === 'up' ? index - 1 : index + 1;
+    if (newIndex < 0 || newIndex >= gameState.players.length) return;
+
+    setGameState(prev => {
+      const newPlayers = [...prev.players];
+      [newPlayers[index], newPlayers[newIndex]] = [newPlayers[newIndex], newPlayers[index]];
+      return { ...prev, players: newPlayers };
+    });
+  };
+
+  // Helper to create a ghost entity for 2-3 player mode
+  const createGhost = (name: string): Player => ({
+    id: `ghost-${Math.random().toString(36).substring(2, 9)}`,
+    name,
+    peerId: '',
+    isHost: false,
+    isDead: false,
+    hasBlackCat: false,
+    cards: [],
+    hasRevealedWitch: false,
+    immune: false,
+    isGhost: true,
+  });
+
   const startGame = () => {
     if (gameState.players.length < MIN_PLAYERS) return;
 
+    const isSmallGame = gameState.players.length <= 3;
+    let allEntities = [...gameState.players];
+
+    // For 2-3 player games, add ghosts to make 4 total entities
+    if (gameState.players.length === 2) {
+      // Fixed order: Player1 → Ghost1 → Player2 → Ghost2
+      allEntities = [
+        gameState.players[0],
+        createGhost('Ghost 1'),
+        gameState.players[1],
+        createGhost('Ghost 2'),
+      ];
+    } else if (gameState.players.length === 3) {
+      // Add 1 ghost after the last player
+      allEntities = [
+        ...gameState.players,
+        createGhost('Ghost'),
+      ];
+    }
+
     // Distribute Cards
-    const playersWithCards = distributeCards(gameState.players);
+    const playersWithCards = distributeCards(allEntities);
+
+    const startMessage = isSmallGame
+      ? `Small Game Started (${gameState.players.length} players + ${allEntities.length - gameState.players.length} ghost${allEntities.length - gameState.players.length > 1 ? 's' : ''}). Cards distributed.`
+      : "Game Started. Cards distributed.";
 
     setGameState(prev => ({
       ...prev,
       phase: GamePhase.SETUP,
       players: playersWithCards,
+      isSmallGameMode: isSmallGame,
       fakeVotes: {}, // Reset fake votes for new game
-      logs: [...prev.logs, { id: Date.now().toString(), message: "Game Started. Cards distributed.", timestamp: Date.now() }]
+      logs: [...prev.logs, { id: Date.now().toString(), message: startMessage, timestamp: Date.now() }]
     }));
   };
 
@@ -609,6 +672,32 @@ const App: React.FC = () => {
             case GamePhase.SETUP:
                 nextPhase = GamePhase.NIGHT_INITIAL_WITCH;
                 nightConfirmations = []; // Clear for new night phase
+
+                // Small game mode: If only ghosts are witches, place Black Cat randomly
+                if (prev.isSmallGameMode) {
+                    const aliveWitches = prev.players.filter(p => p.hasRevealedWitch && !p.isDead);
+                    const realWitches = aliveWitches.filter(p => !p.isGhost);
+
+                    if (aliveWitches.length > 0 && realWitches.length === 0) {
+                        // Ghost witch places Black Cat on random player (silently - don't reveal ghost is witch)
+                        const validTargets = prev.players.filter(p => !p.isGhost);
+                        if (validTargets.length > 0) {
+                            const randomTarget = validTargets[Math.floor(Math.random() * validTargets.length)];
+                            const newPlayers = prev.players.map(p => ({
+                                ...p,
+                                hasBlackCat: p.id === randomTarget.id
+                            }));
+                            // No special log message - don't reveal that ghost is the witch
+                            return {
+                                ...prev,
+                                phase: nextPhase,
+                                players: newPlayers,
+                                logs,
+                                nightConfirmations: []
+                            };
+                        }
+                    }
+                }
                 break;
             case GamePhase.NIGHT_INITIAL_WITCH:
                 nextPhase = GamePhase.DAY;
@@ -618,10 +707,35 @@ const App: React.FC = () => {
             case GamePhase.DAY:
                 nextPhase = GamePhase.NIGHT_WITCH_VOTE;
                 nightConfirmations = []; // Clear for new night phase
+
+                // Small game mode: Check if only ghosts are witches
+                if (prev.isSmallGameMode) {
+                    const aliveEntities = prev.players.filter(p => !p.isDead);
+                    const aliveWitches = aliveEntities.filter(p => p.hasRevealedWitch);
+                    const realWitches = aliveWitches.filter(p => !p.isGhost);
+
+                    // If all witches are ghosts, select random target (silently - don't reveal ghost is witch)
+                    if (aliveWitches.length > 0 && realWitches.length === 0) {
+                        const validTargets = aliveEntities.filter(p => !p.isGhost); // Ghosts don't target other ghosts
+                        if (validTargets.length > 0) {
+                            const randomTarget = validTargets[Math.floor(Math.random() * validTargets.length)];
+                            // No log message - don't reveal that ghost is the witch
+                            return {
+                                ...prev,
+                                phase: nextPhase,
+                                logs,
+                                nightConfirmations: [],
+                                nightKillTargetId: randomTarget.id
+                            };
+                        }
+                    }
+                }
                 break;
             case GamePhase.NIGHT_WITCH_VOTE:
-                // Check if any living player has an UNREVEALED Constable card
+                // Check if any living entity has an UNREVEALED Constable card
                 // Once the constable card is revealed, the constable power is disabled
+                // Note: Even if a ghost has constable, we still do the fake voting phase
+                // so players can't tell who the constable is
                 const hasActiveConstable = prev.players.some(p =>
                     !p.isDead && p.cards.some(c => c.type === CardType.CONSTABLE && !c.isRevealed)
                 );
@@ -637,10 +751,24 @@ const App: React.FC = () => {
             case GamePhase.NIGHT_CONSTABLE:
                 nextPhase = GamePhase.NIGHT_CONFESSION;
                 nightConfirmations = []; // Clear for new night phase
+
+                // If ghost has constable and no protection was set, auto-skip
+                if (!prev.constableGuardId) {
+                    const ghostConstable = prev.players.find(p =>
+                        !p.isDead && p.isGhost && p.cards.some(c => c.type === CardType.CONSTABLE && !c.isRevealed)
+                    );
+                    if (ghostConstable) {
+                        return { ...prev, phase: nextPhase, logs, turnCounter: nextTurn, nightConfirmations, constableGuardId: 'SKIP' };
+                    }
+                }
                 break;
             case GamePhase.NIGHT_CONFESSION:
-                // Don't auto-resolve here - host will use the resolution modal
-                // This case is handled by resolveNight function
+                // Move to resolution phase where everyone sees who was targeted
+                nextPhase = GamePhase.NIGHT_RESOLUTION;
+                logs.push({ id: Date.now().toString(), message: "Confession period has ended.", timestamp: Date.now() });
+                break;
+            case GamePhase.NIGHT_RESOLUTION:
+                // This is handled by resolveNight function
                 return prev;
         }
 
@@ -656,6 +784,39 @@ const App: React.FC = () => {
       const targetPlayer = prev.players.find(p => p.id === killed);
       let logs = [...prev.logs];
       let deathMessage = "The night was peaceful.";
+
+      // Small game mode: partial damage instead of death
+      if (prev.isSmallGameMode && targetDies && killed && targetPlayer) {
+        const leftNeighborId = getLeftNeighborId(prev.players, killed);
+
+        // If target is a ghost, the host (or any real player) chooses which cards to reveal
+        const chooserId = targetPlayer.isGhost
+          ? prev.players.find(p => !p.isGhost && !p.isDead)?.id || ''
+          : leftNeighborId || '';
+
+        if (chooserId) {
+          const chooser = prev.players.find(p => p.id === chooserId);
+          logs.push({
+            id: Date.now().toString(),
+            message: `${targetPlayer.name} was attacked! ${chooser?.name || 'Someone'} must choose 2 cards to reveal.`,
+            timestamp: Date.now()
+          });
+
+          // Reset immunity and set up card selection
+          const newPlayers = prev.players.map(p => ({ ...p, immune: false }));
+
+          return {
+            ...prev,
+            players: newPlayers,
+            logs,
+            nightDamageSelection: {
+              targetId: killed,
+              chooserId,
+              pendingReveal: true
+            }
+          };
+        }
+      }
 
       const newPlayers = prev.players.map(p => {
         // Reset immunity for next night
@@ -679,7 +840,7 @@ const App: React.FC = () => {
       logs.push({ id: Date.now().toString(), message: deathMessage, timestamp: Date.now() });
 
       // Check Win
-      const win = checkWinCondition(newPlayers);
+      const win = checkWinCondition(newPlayers, prev.isSmallGameMode);
       if (win) {
         logs.push({ id: Date.now().toString(), message: `${win === 'TOWN_WIN' ? 'Town' : 'Witches'} Win!`, timestamp: Date.now() });
         return {
@@ -689,7 +850,8 @@ const App: React.FC = () => {
           phase: GamePhase.GAME_OVER,
           nightKillTargetId: null,
           constableGuardId: null,
-          witchVotes: []
+          witchVotes: [],
+          nightDamageSelection: null
         };
       }
 
@@ -701,10 +863,85 @@ const App: React.FC = () => {
         turnCounter: prev.turnCounter + 1,
         nightKillTargetId: null,
         constableGuardId: null,
-        witchVotes: []
+        witchVotes: [],
+        nightDamageSelection: null
       };
     });
-    setNightResolutionModal(false);
+  };
+
+  // Small game mode: Apply night damage (reveal 2 cards) after selection
+  const applyNightDamage = (selectedCardIds: string[]) => {
+    setGameState(prev => {
+      if (!prev.nightDamageSelection) return prev;
+
+      const targetId = prev.nightDamageSelection.targetId;
+      const targetPlayer = prev.players.find(p => p.id === targetId);
+      let logs = [...prev.logs];
+
+      const newPlayers = prev.players.map(p => {
+        if (p.id !== targetId) return p;
+
+        // Reveal the selected cards
+        const newCards = p.cards.map(c => ({
+          ...c,
+          isRevealed: selectedCardIds.includes(c.id) ? true : c.isRevealed
+        }));
+
+        // Check if all cards are now revealed (elimination)
+        const allRevealed = newCards.every(c => c.isRevealed);
+
+        return {
+          ...p,
+          cards: newCards,
+          isDead: allRevealed
+        };
+      });
+
+      const updatedTarget = newPlayers.find(p => p.id === targetId);
+      const revealedCount = selectedCardIds.length;
+
+      if (updatedTarget?.isDead) {
+        logs.push({
+          id: Date.now().toString(),
+          message: `${targetPlayer?.name} had all their cards revealed and has been eliminated!`,
+          timestamp: Date.now()
+        });
+      } else {
+        logs.push({
+          id: Date.now().toString(),
+          message: `${targetPlayer?.name} lost ${revealedCount} card(s) to the night attack.`,
+          timestamp: Date.now()
+        });
+      }
+
+      // Check Win
+      const win = checkWinCondition(newPlayers, prev.isSmallGameMode);
+      if (win) {
+        logs.push({ id: Date.now().toString(), message: `${win === 'TOWN_WIN' ? 'Town' : 'Witches'} Win!`, timestamp: Date.now() });
+        return {
+          ...prev,
+          players: newPlayers,
+          logs,
+          phase: GamePhase.GAME_OVER,
+          nightKillTargetId: null,
+          constableGuardId: null,
+          witchVotes: [],
+          nightDamageSelection: null
+        };
+      }
+
+      return {
+        ...prev,
+        players: newPlayers,
+        phase: GamePhase.DAY,
+        logs,
+        turnCounter: prev.turnCounter + 1,
+        nightKillTargetId: null,
+        constableGuardId: null,
+        witchVotes: [],
+        nightDamageSelection: null
+      };
+    });
   };
 
   const processPlayerAction = (playerId: string, action: string, data: any) => {
@@ -717,14 +954,19 @@ const App: React.FC = () => {
             const accuser = updates.players.find(p => p.id === playerId);
             const target = updates.players.find(p => p.id === data.targetId);
             if (accuser && target && !target.isDead) {
+                // If target is a ghost, auto-accept (ghosts can't respond)
+                const isGhostTarget = target.isGhost;
                 updates.pendingAccusation = {
                     accuserId: playerId,
                     accuserName: accuser.name,
                     targetId: data.targetId,
                     targetName: target.name,
-                    accepted: false
+                    accepted: isGhostTarget // Auto-accept for ghosts
                 };
                 logs.push({ id: Date.now().toString(), message: `${accuser.name} accuses ${target.name}!`, timestamp: Date.now() });
+                if (isGhostTarget) {
+                    logs.push({ id: Date.now().toString(), message: `The ghost cannot object...`, timestamp: Date.now() });
+                }
             }
         } else if (action === 'ACCUSE_ACCEPT') {
             // Target accepts the accusation
@@ -795,6 +1037,19 @@ const App: React.FC = () => {
                     }
                 ];
 
+                // Auto-add votes for ghost witches (they match the real witch's vote)
+                const ghostWitches = updates.players.filter(p => p.isGhost && p.hasRevealedWitch && !p.isDead);
+                for (const ghost of ghostWitches) {
+                    if (!updates.witchVotes.some(v => v.voterId === ghost.id)) {
+                        updates.witchVotes.push({
+                            voterId: ghost.id,
+                            witchName: ghost.name,
+                            targetId: data.targetId,
+                            targetName: target.name
+                        });
+                    }
+                }
+
                 // Apply the Black Cat placement (last vote wins, host can wait for consensus)
                 updates.players = updates.players.map(p => ({
                     ...p,
@@ -825,6 +1080,19 @@ const App: React.FC = () => {
                     }
                 ];
 
+                // Auto-add votes for ghost witches (they match the real witch's vote)
+                const ghostWitches = updates.players.filter(p => p.isGhost && p.hasRevealedWitch && !p.isDead);
+                for (const ghost of ghostWitches) {
+                    if (!updates.witchVotes.some(v => v.voterId === ghost.id)) {
+                        updates.witchVotes.push({
+                            voterId: ghost.id,
+                            witchName: ghost.name,
+                            targetId: data.targetId,
+                            targetName: target.name
+                        });
+                    }
+                }
+
                 // Also set nightKillTargetId to the most recent vote (host can override)
                 updates.nightKillTargetId = data.targetId;
 
@@ -835,6 +1103,13 @@ const App: React.FC = () => {
             }
         } else if (action === 'GUARD_VOTE') {
             updates.constableGuardId = data.targetId;
+            // Also count as confirmation
+            if (!updates.nightConfirmations.includes(playerId)) {
+                updates.nightConfirmations = [...updates.nightConfirmations, playerId];
+            }
+        } else if (action === 'GUARD_SKIP') {
+            // Small game mode: Constable can choose not to protect anyone
+            updates.constableGuardId = 'SKIP';
             // Also count as confirmation
             if (!updates.nightConfirmations.includes(playerId)) {
                 updates.nightConfirmations = [...updates.nightConfirmations, playerId];
@@ -866,26 +1141,109 @@ const App: React.FC = () => {
                  const revealedCards = player.cards.filter(c => c.isRevealed);
                  player.cards = [...shuffle(hiddenCards), ...revealedCards];
              }
+        } else if (action === 'SHUFFLE_GHOST') {
+            // Small game mode: Shuffle a ghost's hidden cards after peeking
+            const ghost = updates.players.find(p => p.id === data.ghostId && p.isGhost);
+            if (ghost) {
+                const hiddenCards = ghost.cards.filter(c => !c.isRevealed);
+                const revealedCards = ghost.cards.filter(c => c.isRevealed);
+                ghost.cards = [...shuffle(hiddenCards), ...revealedCards];
+            }
+        } else if (action === 'NIGHT_DAMAGE_SELECT') {
+            // Small game mode: Left neighbor selects cards to reveal for night damage
+            if (updates.nightDamageSelection && updates.nightDamageSelection.chooserId === playerId) {
+                const targetId = updates.nightDamageSelection.targetId;
+                const selectedCardIds = data.cardIds as string[];
+                const targetPlayer = updates.players.find(p => p.id === targetId);
+
+                // Reveal the selected cards
+                updates.players = updates.players.map(p => {
+                    if (p.id !== targetId) return p;
+
+                    const newCards = p.cards.map(c => ({
+                        ...c,
+                        isRevealed: selectedCardIds.includes(c.id) ? true : c.isRevealed
+                    }));
+
+                    const allRevealed = newCards.every(c => c.isRevealed);
+
+                    return {
+                        ...p,
+                        cards: newCards,
+                        isDead: allRevealed
+                    };
+                });
+
+                const updatedTarget = updates.players.find(p => p.id === targetId);
+
+                if (updatedTarget?.isDead) {
+                    logs.push({
+                        id: Date.now().toString(),
+                        message: `${targetPlayer?.name} had all their cards revealed and has been eliminated!`,
+                        timestamp: Date.now()
+                    });
+                } else {
+                    logs.push({
+                        id: Date.now().toString(),
+                        message: `${targetPlayer?.name} lost ${selectedCardIds.length} card(s) to the night attack.`,
+                        timestamp: Date.now()
+                    });
+                }
+
+                // Check win condition
+                const win = checkWinCondition(updates.players, updates.isSmallGameMode);
+                if (win) {
+                    logs.push({ id: Date.now().toString(), message: `${win === 'TOWN_WIN' ? 'Town' : 'Witches'} Win!`, timestamp: Date.now() });
+                    updates.phase = GamePhase.GAME_OVER;
+                } else {
+                    updates.phase = GamePhase.DAY;
+                    updates.turnCounter = updates.turnCounter + 1;
+                }
+
+                updates.nightKillTargetId = null;
+                updates.constableGuardId = null;
+                updates.witchVotes = [];
+                updates.nightDamageSelection = null;
+            }
         } else if (action === 'TRIGGER_CONSPIRACY') {
             // Enter conspiracy phase - players will select cards from left neighbor
             updates.phase = GamePhase.CONSPIRACY;
             updates.conspiracySelections = [];
             logs.push({ id: Date.now().toString(), message: "Conspiracy begins! Each player selects a hidden card from their left neighbor.", timestamp: Date.now() });
-        } else if (action === 'CONSPIRACY_SELECT') {
-            // Player selects a card from their left neighbor
-            const existingSelections = updates.conspiracySelections.filter(s => s.playerId !== playerId);
+        } else if (action === 'CONSPIRACY_SELECT' || action === 'CONSPIRACY_SELECT_FOR_OTHER') {
+            // Player selects a card from their left neighbor (or for another player in ghost mode)
+            const targetPlayerId = action === 'CONSPIRACY_SELECT_FOR_OTHER' ? data.forPlayerId : playerId;
+            const existingSelections = updates.conspiracySelections.filter(s => s.playerId !== targetPlayerId);
             updates.conspiracySelections = [
                 ...existingSelections,
-                { playerId, selectedCardId: data.cardId }
+                { playerId: targetPlayerId, selectedCardId: data.cardId }
             ];
 
-            // Check if all living players have selected
-            const alivePlayers = updates.players.filter(p => !p.isDead);
-            const allSelected = alivePlayers.every(p =>
+            // Check if all living real players have selected (ghosts don't select)
+            const aliveRealPlayers = updates.players.filter(p => !p.isDead && !p.isGhost);
+            const allSelected = aliveRealPlayers.every(p =>
                 updates.conspiracySelections.some(s => s.playerId === p.id)
             );
 
             if (allSelected) {
+                // Auto-add selections for ghosts (random card from their left neighbor)
+                const aliveEntitiesList = updates.players.filter(p => !p.isDead);
+                const ghosts = aliveEntitiesList.filter(p => p.isGhost);
+                for (const ghost of ghosts) {
+                    const ghostIndex = aliveEntitiesList.findIndex(p => p.id === ghost.id);
+                    let leftIndex = ghostIndex - 1;
+                    if (leftIndex < 0) leftIndex = aliveEntitiesList.length - 1;
+                    const leftNeighbor = aliveEntitiesList[leftIndex];
+                    const hiddenCards = leftNeighbor?.cards.filter(c => !c.isRevealed) || [];
+                    if (hiddenCards.length > 0) {
+                        const randomCard = hiddenCards[Math.floor(Math.random() * hiddenCards.length)];
+                        updates.conspiracySelections.push({
+                            playerId: ghost.id,
+                            selectedCardId: randomCard.id
+                        });
+                    }
+                }
+
                 // Process card transfers based on selections
                 const cardTransfers: { fromPlayerId: string; toPlayerId: string; cardId: string }[] = [];
 
@@ -893,12 +1251,12 @@ const App: React.FC = () => {
                     const receivingPlayer = updates.players.find(p => p.id === selection.playerId);
                     if (!receivingPlayer || receivingPlayer.isDead) continue;
 
-                    // Find left neighbor (previous alive player in array order)
-                    const alivePlayersList = updates.players.filter(p => !p.isDead);
-                    const receiverIndex = alivePlayersList.findIndex(p => p.id === selection.playerId);
+                    // Find left neighbor (previous alive entity in array order)
+                    const aliveEntitiesList = updates.players.filter(p => !p.isDead);
+                    const receiverIndex = aliveEntitiesList.findIndex(p => p.id === selection.playerId);
                     let leftNeighborIndex = receiverIndex - 1;
-                    if (leftNeighborIndex < 0) leftNeighborIndex = alivePlayersList.length - 1;
-                    const leftNeighbor = alivePlayersList[leftNeighborIndex];
+                    if (leftNeighborIndex < 0) leftNeighborIndex = aliveEntitiesList.length - 1;
+                    const leftNeighbor = aliveEntitiesList[leftNeighborIndex];
 
                     if (leftNeighbor) {
                         cardTransfers.push({
@@ -909,26 +1267,40 @@ const App: React.FC = () => {
                     }
                 }
 
-                // Execute transfers
-                for (const transfer of cardTransfers) {
-                    const fromPlayer = updates.players.find(p => p.id === transfer.fromPlayerId);
-                    const toPlayer = updates.players.find(p => p.id === transfer.toPlayerId);
+                // Execute transfers using immutable updates
+                // First, create a map of playerId -> new cards array (deep copy)
+                const playerCardsMap = new Map<string, Card[]>();
+                updates.players.forEach(p => {
+                    playerCardsMap.set(p.id, [...p.cards]);
+                });
 
-                    if (fromPlayer && toPlayer) {
-                        const cardIndex = fromPlayer.cards.findIndex(c => c.id === transfer.cardId);
+                // Track which players become witches
+                const newWitchPlayerIds: string[] = [];
+
+                for (const transfer of cardTransfers) {
+                    const fromCards = playerCardsMap.get(transfer.fromPlayerId);
+                    const toCards = playerCardsMap.get(transfer.toPlayerId);
+
+                    if (fromCards && toCards) {
+                        const cardIndex = fromCards.findIndex(c => c.id === transfer.cardId);
                         if (cardIndex !== -1) {
-                            const [card] = fromPlayer.cards.splice(cardIndex, 1);
-                            toPlayer.cards.push(card);
-                            // Shuffle receiving player's cards so previous owner doesn't know position
-                            toPlayer.cards = shuffle(toPlayer.cards);
+                            const [card] = fromCards.splice(cardIndex, 1);
+                            toCards.push(card);
 
                             // Check infection
                             if (card.type === CardType.WITCH) {
-                                toPlayer.hasRevealedWitch = true;
+                                newWitchPlayerIds.push(transfer.toPlayerId);
                             }
                         }
                     }
                 }
+
+                // Apply the card changes back to players (immutably)
+                updates.players = updates.players.map(p => ({
+                    ...p,
+                    cards: shuffle(playerCardsMap.get(p.id) || p.cards),
+                    hasRevealedWitch: p.hasRevealedWitch || newWitchPlayerIds.includes(p.id)
+                }));
 
                 logs.push({ id: Date.now().toString(), message: "Conspiracy complete! Cards have been passed.", timestamp: Date.now() });
                 updates.phase = GamePhase.DAY;
@@ -937,7 +1309,7 @@ const App: React.FC = () => {
         }
 
         // Check Win Condition on any state change that might kill someone
-        const win = checkWinCondition(updates.players);
+        const win = checkWinCondition(updates.players, updates.isSmallGameMode);
         if (win && prev.phase !== GamePhase.GAME_OVER) {
              logs.push({ id: Date.now().toString(), message: `${win === 'TOWN_WIN' ? 'Town' : 'Witches'} Win!`, timestamp: Date.now() });
              updates.phase = GamePhase.GAME_OVER;
@@ -1020,6 +1392,7 @@ const App: React.FC = () => {
     gameState.phase === GamePhase.NIGHT_WITCH_VOTE ||
     gameState.phase === GamePhase.NIGHT_CONSTABLE ||
     gameState.phase === GamePhase.NIGHT_CONFESSION ||
+    gameState.phase === GamePhase.NIGHT_RESOLUTION ||
     gameState.phase === GamePhase.CONSPIRACY ||
     showMyHand;
 
@@ -1155,7 +1528,14 @@ const App: React.FC = () => {
         isDarkMode ? 'bg-slate-800' : 'bg-white border-b border-stone-200'
       }`}>
           <div>
-              <h2 className={`font-bold text-lg ${isDarkMode ? 'text-indigo-400' : 'text-amber-700'}`}>{PHASE_TITLES[gameState.phase]}</h2>
+              <div className="flex items-center gap-2">
+                  <h2 className={`font-bold text-lg ${isDarkMode ? 'text-indigo-400' : 'text-amber-700'}`}>{PHASE_TITLES[gameState.phase]}</h2>
+                  {gameState.isSmallGameMode && (
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${isDarkMode ? 'bg-purple-900/50 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
+                          Small Game
+                      </span>
+                  )}
+              </div>
               <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-stone-500'}`}>Room: <span className={`font-mono tracking-widest ${isDarkMode ? 'text-white' : 'text-stone-700'}`}>{gameState.roomId}</span></p>
           </div>
           <div className="flex items-center gap-3">
@@ -1204,7 +1584,8 @@ const App: React.FC = () => {
                 `}
               >
                   <div className="font-bold flex items-center gap-2">
-                    {p.name}
+                    {p.isGhost && <span title="Ghost">👻</span>}
+                    <span className={p.isGhost ? 'text-slate-400' : ''}>{p.name}</span>
                     {p.isDisconnected && <span className="text-xs text-yellow-500">(Offline)</span>}
                   </div>
                   <div className="text-xs text-slate-400">
@@ -1349,7 +1730,8 @@ const App: React.FC = () => {
                   {witchTeam.map(p => (
                     <div key={p.id} className={`flex flex-col ${p.isDead ? 'opacity-50' : ''}`}>
                       <div className="flex items-center gap-2">
-                        <span className="font-medium text-stone-800">{p.name}</span>
+                        {p.isGhost && <span title="Ghost">👻</span>}
+                        <span className={`font-medium ${p.isGhost ? 'text-slate-400' : 'text-stone-800'}`}>{p.name}</span>
                         {p.isDead && <span className="text-xs text-red-500">☠️</span>}
                         {!p.isDead && <span className="text-xs text-green-500">✓</span>}
                       </div>
@@ -1371,7 +1753,8 @@ const App: React.FC = () => {
                 {townTeam.map(p => (
                   <div key={p.id} className={`flex flex-col ${p.isDead ? 'opacity-50' : ''}`}>
                     <div className="flex items-center gap-2">
-                      <span className="font-medium text-stone-800">{p.name}</span>
+                      {p.isGhost && <span title="Ghost">👻</span>}
+                      <span className={`font-medium ${p.isGhost ? 'text-slate-400' : 'text-stone-800'}`}>{p.name}</span>
                       {p.isDead && <span className="text-xs text-red-500">☠️</span>}
                       {!p.isDead && <span className="text-xs text-green-500">✓</span>}
                     </div>
@@ -1415,14 +1798,44 @@ const App: React.FC = () => {
                       <p className="text-stone-500">Share this code with others on your network.</p>
                   </div>
 
-                  <h4 className="font-bold mb-2 text-stone-700">Players ({gameState.players.length})</h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mb-8">
-                      {gameState.players.map(p => (
+                  <div className="flex items-center justify-between mb-2">
+                      <h4 className="font-bold text-stone-700">Players ({gameState.players.length})</h4>
+                      {isHost && gameState.players.length > 2 && (
+                          <span className="text-xs text-stone-500">Use arrows to reorder seating</span>
+                      )}
+                      {isHost && gameState.players.length === 2 && (
+                          <span className="text-xs text-stone-400">Seating fixed for 2-player mode</span>
+                      )}
+                  </div>
+                  <div className="flex flex-col gap-2 mb-8">
+                      {gameState.players.map((p, index) => (
                           <div key={p.id} className={`bg-white p-3 rounded-lg border border-stone-200 flex items-center justify-between text-stone-800 shadow-sm ${p.isDisconnected ? 'opacity-50' : ''}`}>
-                              <span>
-                                {p.name} {p.isHost && '👑'}
-                                {p.isDisconnected && <span className="text-yellow-600 text-xs ml-1">(Offline)</span>}
-                              </span>
+                              <div className="flex items-center gap-2">
+                                  <span className="text-stone-400 text-sm w-6">{index + 1}.</span>
+                                  <span>
+                                    {p.name} {p.isHost && '👑'}
+                                    {p.isDisconnected && <span className="text-yellow-600 text-xs ml-1">(Offline)</span>}
+                                  </span>
+                              </div>
+                              {/* Disable reordering for 2-player mode (fixed seating: Player→Ghost→Player→Ghost) */}
+                              {isHost && gameState.players.length > 2 && (
+                                  <div className="flex gap-1">
+                                      <button
+                                          onClick={() => movePlayer(index, 'up')}
+                                          disabled={index === 0}
+                                          className={`px-2 py-1 text-sm rounded ${index === 0 ? 'text-stone-300 cursor-not-allowed' : 'text-stone-600 hover:bg-stone-100'}`}
+                                      >
+                                          ↑
+                                      </button>
+                                      <button
+                                          onClick={() => movePlayer(index, 'down')}
+                                          disabled={index === gameState.players.length - 1}
+                                          className={`px-2 py-1 text-sm rounded ${index === gameState.players.length - 1 ? 'text-stone-300 cursor-not-allowed' : 'text-stone-600 hover:bg-stone-100'}`}
+                                      >
+                                          ↓
+                                      </button>
+                                  </div>
+                              )}
                           </div>
                       ))}
                   </div>
@@ -1613,7 +2026,7 @@ const App: React.FC = () => {
                 {isHost && (
                     <div className="mt-4 p-3 bg-slate-800 border border-slate-600 rounded-lg">
                         {(() => {
-                            const alivePlayers = gameState.players.filter(p => !p.isDead && !p.isDisconnected);
+                            const alivePlayers = gameState.players.filter(p => !p.isDead && !p.isDisconnected && !p.isGhost);
                             const allConfirmed = (gameState.nightConfirmations || []).length === alivePlayers.length;
                             return (
                                 <div className="text-sm">
@@ -1661,19 +2074,45 @@ const App: React.FC = () => {
                                 </p>
                                 <p className="text-sm text-slate-400 mt-2">Waiting for others...</p>
                             </div>
+                        ) : gameState.constableGuardId === 'SKIP' ? (
+                            <div className="text-center p-4 bg-yellow-900/30 border border-yellow-600 rounded-lg">
+                                <p className="text-yellow-300 font-medium">
+                                    You have chosen not to protect anyone tonight.
+                                </p>
+                                <p className="text-sm text-slate-400 mt-2">Waiting for others...</p>
+                            </div>
                         ) : (
                             <>
+                                {gameState.isSmallGameMode && (
+                                    <p className="text-xs text-blue-400 mb-2 italic">
+                                        In small game mode, you may protect yourself or skip protection entirely.
+                                    </p>
+                                )}
                                 <PlayerGrid
                                     onSelect={setSelectedPlayerId}
-                                    filter={(p) => !p.isDead && p.id !== myPlayerId}  // Constable cannot guard self (rulebook p.8-9)
+                                    // In small game mode, constable CAN protect self (rulebook 2-3 players p.17)
+                                    filter={(p) => !p.isDead && (gameState.isSmallGameMode || p.id !== myPlayerId)}
                                 />
-                                {selectedPlayerId && (
-                                    <Button fullWidth onClick={() => {
-                                        sendAction('GUARD_VOTE', { targetId: selectedPlayerId });
-                                    }}>
-                                        Protect Player
-                                    </Button>
-                                )}
+                                <div className="flex gap-2 mt-2">
+                                    {selectedPlayerId && (
+                                        <Button fullWidth onClick={() => {
+                                            sendAction('GUARD_VOTE', { targetId: selectedPlayerId });
+                                        }}>
+                                            Protect Player
+                                        </Button>
+                                    )}
+                                    {gameState.isSmallGameMode && (
+                                        <Button
+                                            fullWidth
+                                            variant="secondary"
+                                            onClick={() => {
+                                                sendAction('GUARD_SKIP', {});
+                                            }}
+                                        >
+                                            Skip Protection
+                                        </Button>
+                                    )}
+                                </div>
                             </>
                         )}
                     </div>
@@ -1716,7 +2155,7 @@ const App: React.FC = () => {
                 {isHost && (
                     <div className="mt-4 p-3 bg-slate-800 border border-slate-600 rounded-lg">
                         {(() => {
-                            const alivePlayers = gameState.players.filter(p => !p.isDead && !p.isDisconnected);
+                            const alivePlayers = gameState.players.filter(p => !p.isDead && !p.isDisconnected && !p.isGhost);
                             const allConfirmed = (gameState.nightConfirmations || []).length === alivePlayers.length;
                             return (
                                 <div className="text-sm">
@@ -1748,7 +2187,7 @@ const App: React.FC = () => {
                  <p className="text-sm text-slate-400 mb-4">You may reveal a non-Witch card to gain immunity for tonight. Or pass to stay silent.</p>
 
                  {/* Show who has the Gavel token (protection) - visible to all per rulebook p.11 */}
-                 {gameState.constableGuardId && (
+                 {gameState.constableGuardId && gameState.constableGuardId !== 'SKIP' && (
                      <div className="mb-4 p-3 bg-blue-900/30 border border-blue-600 rounded-lg flex items-center gap-3">
                          <span className="text-2xl">🔨</span>
                          <div>
@@ -1756,6 +2195,17 @@ const App: React.FC = () => {
                                  {gameState.players.find(p => p.id === gameState.constableGuardId)?.name} has the Gavel token
                              </p>
                              <p className="text-xs text-slate-400">This player is protected from death tonight.</p>
+                         </div>
+                     </div>
+                 )}
+                 {gameState.constableGuardId === 'SKIP' && (
+                     <div className="mb-4 p-3 bg-yellow-900/30 border border-yellow-600 rounded-lg flex items-center gap-3">
+                         <span className="text-2xl">🔨</span>
+                         <div>
+                             <p className="text-yellow-300 font-medium">
+                                 The Constable chose not to protect anyone
+                             </p>
+                             <p className="text-xs text-slate-400">No one has the Gavel token tonight.</p>
                          </div>
                      </div>
                  )}
@@ -1798,25 +2248,25 @@ const App: React.FC = () => {
                  </>
                  )}
 
-                 {/* Host: Show binary ready status and end confession button - visible even when dead */}
+                 {/* Host: Show ready status and end confession button */}
                  {isHost && (
                      <div className="mt-6 p-4 bg-slate-800 border border-slate-600 rounded-lg">
                          {(() => {
-                             const alivePlayers = gameState.players.filter(p => !p.isDead && !p.isDisconnected);
+                             const alivePlayers = gameState.players.filter(p => !p.isDead && !p.isDisconnected && !p.isGhost);
                              const allConfirmed = (gameState.nightConfirmations || []).length === alivePlayers.length;
                              return (
                                  <>
                                      <div className="text-sm mb-3">
                                          {allConfirmed ? (
-                                             <span className="text-green-400">✓ Ready</span>
+                                             <span className="text-green-400">✓ All players ready</span>
                                          ) : (
-                                             <span className="text-yellow-400">⏳ In progress...</span>
+                                             <span className="text-yellow-400">⏳ Waiting for confessions...</span>
                                          )}
                                      </div>
                                      <p className="text-sm text-slate-400 mb-3">
                                          Wait for the hourglass to run out, then end the confession period.
                                      </p>
-                                     <Button fullWidth onClick={() => setNightResolutionModal(true)}>
+                                     <Button fullWidth onClick={advancePhase}>
                                          End Confession Period
                                      </Button>
                                  </>
@@ -1825,105 +2275,109 @@ const App: React.FC = () => {
                      </div>
                  )}
 
-                 {/* Night Resolution Modal */}
-                 {nightResolutionModal && (
-                     <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-                         <div className="bg-slate-800 p-6 rounded-xl max-w-md w-full">
-                             <h3 className="text-xl font-bold mb-4 text-yellow-400">Resolve Night</h3>
-
-                             {gameState.nightKillTargetId ? (() => {
-                                 const target = gameState.players.find(p => p.id === gameState.nightKillTargetId);
-                                 const isProtectedByConstable = gameState.nightKillTargetId === gameState.constableGuardId;
-                                 const hasConfessed = target?.immune;
-                                 const hasTrackedProtection = isProtectedByConstable || hasConfessed;
-
-                                 return (
-                                     <div>
-                                         <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded-lg">
-                                             <p className="text-red-300 font-medium text-center">
-                                                 Witches targeted: <span className="font-bold">{target?.name}</span>
-                                             </p>
-                                         </div>
-
-                                         <div className="space-y-2 text-sm mb-4">
-                                             <div className={`p-2 rounded ${isProtectedByConstable ? 'bg-blue-900/30 border border-blue-600' : 'bg-slate-700/50'}`}>
-                                                 <span className={isProtectedByConstable ? 'text-blue-300' : 'text-slate-400'}>
-                                                     {isProtectedByConstable ? '✓ Protected by Constable (Gavel token)' : '✗ Not protected by Constable'}
-                                                 </span>
-                                             </div>
-                                             <div className={`p-2 rounded ${hasConfessed ? 'bg-yellow-900/30 border border-yellow-600' : 'bg-slate-700/50'}`}>
-                                                 <span className={hasConfessed ? 'text-yellow-300' : 'text-slate-400'}>
-                                                     {hasConfessed ? '✓ Confessed (revealed a card)' : '✗ Did not confess'}
-                                                 </span>
-                                             </div>
-                                             <div className="p-2 rounded bg-slate-700/50">
-                                                 <span className="text-slate-400">? Asylum card (check physically)</span>
-                                             </div>
-                                             <div className="p-2 rounded bg-slate-700/50">
-                                                 <span className="text-slate-400">? Town Hall abilities (check physically)</span>
-                                             </div>
-                                         </div>
-
-                                         {hasTrackedProtection ? (
-                                             // Auto-survive: player has Constable protection or confessed
-                                             <div>
-                                                 <div className="mb-4 p-3 bg-green-900/30 border border-green-600 rounded-lg text-center">
-                                                     <p className="text-green-300 font-medium">
-                                                         {target?.name} is protected and survives!
-                                                     </p>
-                                                 </div>
-                                                 <Button fullWidth onClick={() => resolveNight(false)}>
-                                                     Continue to Day
-                                                 </Button>
-                                             </div>
-                                         ) : (
-                                             // Manual decision needed: check Asylum/Town Hall
-                                             <div>
-                                                 <p className="text-sm text-slate-400 mb-4 text-center">
-                                                     Check for Asylum card and Town Hall abilities.<br/>
-                                                     Does <span className="font-bold text-white">{target?.name}</span> survive or die?
-                                                 </p>
-                                                 <div className="flex gap-3">
-                                                     <Button
-                                                         fullWidth
-                                                         variant="secondary"
-                                                         onClick={() => resolveNight(false)}
-                                                     >
-                                                         {target?.name} Survives
-                                                     </Button>
-                                                     <Button
-                                                         fullWidth
-                                                         onClick={() => resolveNight(true)}
-                                                         className="bg-red-700 hover:bg-red-600"
-                                                     >
-                                                         {target?.name} Dies
-                                                     </Button>
-                                                 </div>
-                                             </div>
-                                         )}
-                                     </div>
-                                 );
-                             })() : (
-                                 <div>
-                                     <p className="text-slate-400 text-center mb-4">No target was selected by the witches.</p>
-                                     <Button fullWidth onClick={() => resolveNight(false)}>
-                                         Continue to Day
-                                     </Button>
-                                 </div>
-                             )}
-
-                             <Button
-                                 fullWidth
-                                 variant="ghost"
-                                 className="mt-3"
-                                 onClick={() => setNightResolutionModal(false)}
-                             >
-                                 Cancel
-                             </Button>
-                         </div>
+                 {/* Non-host waiting message */}
+                 {!isHost && (
+                     <div className="mt-6 p-3 bg-slate-800 border border-slate-600 rounded-lg">
+                         <p className="text-sm text-slate-400 text-center">⏳ Waiting for host to end confession period...</p>
                      </div>
                  )}
+
              </div>
+        )}
+
+        {gameState.phase === GamePhase.NIGHT_RESOLUTION && (
+            <div className="border border-red-500/30 bg-red-900/10 p-6 rounded-xl">
+                <h3 className="text-xl font-bold text-red-400 mb-4">Night Resolution</h3>
+
+                {gameState.nightKillTargetId ? (() => {
+                    const target = gameState.players.find(p => p.id === gameState.nightKillTargetId);
+                    const isProtectedByConstable = gameState.nightKillTargetId === gameState.constableGuardId;
+                    const hasConfessed = target?.immune;
+
+                    return (
+                        <div>
+                            <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded-lg">
+                                <p className="text-red-300 font-medium text-center">
+                                    Witches targeted: <span className="font-bold">{target?.name}</span>
+                                </p>
+                            </div>
+
+                            <div className="space-y-2 text-sm mb-4">
+                                <div className={`p-2 rounded ${isProtectedByConstable ? 'bg-blue-900/30 border border-blue-600' : 'bg-slate-700/50'}`}>
+                                    <span className={isProtectedByConstable ? 'text-blue-300' : 'text-slate-400'}>
+                                        {isProtectedByConstable ? '✓ Protected by Constable (Gavel token)' : '✗ Not protected by Constable'}
+                                    </span>
+                                </div>
+                                <div className={`p-2 rounded ${hasConfessed ? 'bg-yellow-900/30 border border-yellow-600' : 'bg-slate-700/50'}`}>
+                                    <span className={hasConfessed ? 'text-yellow-300' : 'text-slate-400'}>
+                                        {hasConfessed ? '✓ Confessed (revealed a card)' : '✗ Did not confess'}
+                                    </span>
+                                </div>
+                                <div className="p-2 rounded bg-slate-700/50">
+                                    <span className="text-slate-400">? Asylum card (check physically)</span>
+                                </div>
+                                <div className="p-2 rounded bg-slate-700/50">
+                                    <span className="text-slate-400">? Town Hall abilities (check physically)</span>
+                                </div>
+                            </div>
+
+                            {/* Host-only resolution buttons */}
+                            {isHost && (
+                                <>
+                                    {(isProtectedByConstable || hasConfessed) ? (
+                                        <div>
+                                            <div className="mb-3 p-3 bg-green-900/30 border border-green-600 rounded-lg text-center">
+                                                <p className="text-green-300 font-medium">
+                                                    {target?.name} is protected and survives!
+                                                </p>
+                                            </div>
+                                            <Button fullWidth onClick={() => resolveNight(false)}>
+                                                Continue to Day
+                                            </Button>
+                                        </div>
+                                    ) : (
+                                        <div>
+                                            <p className="text-sm text-slate-400 mb-3 text-center">
+                                                Check for Asylum card and Town Hall abilities.<br/>
+                                                Does <span className="font-bold text-white">{target?.name}</span> survive or die?
+                                            </p>
+                                            <div className="flex gap-3">
+                                                <Button fullWidth variant="secondary" onClick={() => resolveNight(false)}>
+                                                    {target?.name} Survives
+                                                </Button>
+                                                <Button fullWidth onClick={() => resolveNight(true)} className="bg-red-700 hover:bg-red-600">
+                                                    {target?.name} Dies
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </>
+                            )}
+
+                            {/* Non-host sees waiting message */}
+                            {!isHost && (
+                                <p className="text-sm text-slate-400 text-center italic">
+                                    Waiting for host to resolve the night...
+                                </p>
+                            )}
+                        </div>
+                    );
+                })() : (
+                    <div>
+                        <p className="text-slate-400 text-center mb-4">No target was selected by the witches.</p>
+                        {isHost && (
+                            <Button fullWidth onClick={() => resolveNight(false)}>
+                                Continue to Day
+                            </Button>
+                        )}
+                        {!isHost && (
+                            <p className="text-sm text-slate-400 text-center italic">
+                                Waiting for host to continue...
+                            </p>
+                        )}
+                    </div>
+                )}
+            </div>
         )}
 
         {gameState.phase === GamePhase.CONSPIRACY && (
@@ -1933,33 +2387,35 @@ const App: React.FC = () => {
                     Select ONE hidden card from your left neighbor to take into your hand.
                 </p>
 
-                {!myPlayer?.isDead ? (() => {
-                    // Find left neighbor (previous alive player)
-                    const alivePlayers = gameState.players.filter(p => !p.isDead);
-                    const myIndex = alivePlayers.findIndex(p => p.id === myPlayerId);
+                {!myPlayer?.isDead && !myPlayer?.isGhost ? (() => {
+                    // Find left neighbor (previous alive entity)
+                    const aliveEntities = gameState.players.filter(p => !p.isDead);
+                    const myIndex = aliveEntities.findIndex(p => p.id === myPlayerId);
                     let leftIndex = myIndex - 1;
-                    if (leftIndex < 0) leftIndex = alivePlayers.length - 1;
-                    const leftNeighbor = alivePlayers[leftIndex];
+                    if (leftIndex < 0) leftIndex = aliveEntities.length - 1;
+                    const leftNeighbor = aliveEntities[leftIndex];
 
                     // Check if I already selected
                     const mySelection = gameState.conspiracySelections.find(s => s.playerId === myPlayerId);
 
-                    // Get left neighbor's hidden cards
+                    // Get left neighbor's hidden cards (for my own selection)
+                    // Works for both regular players and ghosts - you pick from their cards
                     const hiddenCards = leftNeighbor?.cards.filter(c => !c.isRevealed) || [];
 
                     return (
                         <div>
+                            {/* Show left neighbor info */}
                             <div className="mb-4 p-3 bg-orange-900/30 border border-orange-700 rounded-lg">
                                 <p className="text-sm text-orange-300">
-                                    Your left neighbor is: <span className="font-bold">{leftNeighbor?.name}</span>
+                                    Your left neighbor is: {leftNeighbor?.isGhost && '👻 '}<span className={`font-bold ${leftNeighbor?.isGhost ? 'text-slate-400' : ''}`}>{leftNeighbor?.name}</span>
                                 </p>
                             </div>
 
                             {mySelection ? (
-                                <div className="text-center p-4 bg-green-900/30 border border-green-600 rounded-lg">
+                                <div className="text-center p-4 bg-green-900/30 border border-green-600 rounded-lg mb-4">
                                     <p className="text-green-300 font-medium">You have selected a card.</p>
                                     <p className="text-sm text-slate-400 mt-2">
-                                        Waiting for other players... ({gameState.conspiracySelections.length}/{alivePlayers.length})
+                                        Waiting for other players... ({gameState.conspiracySelections.length}/{aliveEntities.filter(p => !p.isGhost).length})
                                     </p>
                                 </div>
                             ) : (
@@ -1996,11 +2452,11 @@ const App: React.FC = () => {
                                 </>
                             )}
 
-                            {/* Progress indicator */}
+                            {/* Progress indicator - only show real players, not ghosts */}
                             <div className="mt-4 pt-4 border-t border-slate-700">
                                 <p className="text-xs text-slate-500 mb-2">Selection Progress:</p>
                                 <div className="flex gap-2 flex-wrap">
-                                    {alivePlayers.map(p => {
+                                    {aliveEntities.filter(p => !p.isGhost).map(p => {
                                         const hasSelected = gameState.conspiracySelections.some(s => s.playerId === p.id);
                                         return (
                                             <div
@@ -2143,7 +2599,8 @@ const App: React.FC = () => {
                                 } ${p.isDisconnected ? 'opacity-50' : ''}`}>
                                     <div className={`font-bold flex justify-between ${isDarkMode ? 'text-white' : 'text-stone-800'}`}>
                                         <span className="flex items-center gap-1">
-                                          {p.name}
+                                          {p.isGhost && <span title="Ghost">👻</span>}
+                                          <span className={p.isGhost ? 'text-slate-400' : ''}>{p.name}</span>
                                           {p.isDisconnected && <span className="text-yellow-600 text-xs">(Offline)</span>}
                                         </span>
                                         {p.hasBlackCat && <span>🐈‍⬛</span>}
@@ -2188,6 +2645,23 @@ const App: React.FC = () => {
                                             onClick={() => sendAction('ACCUSE_START', { targetId: p.id })}
                                         >
                                             Accuse
+                                        </button>
+                                    )}
+                                    {/* Peek & Shuffle button for ghosts (small game mode) */}
+                                    {p.isGhost && !p.isDead && hiddenCards.length > 0 && !myPlayer?.isDead && (
+                                        <button
+                                            className={`mt-2 text-xs px-2 py-1 rounded w-full border ${
+                                              isDarkMode
+                                                ? 'bg-purple-900/50 hover:bg-purple-900 text-purple-200 border-purple-800'
+                                                : 'bg-purple-100 hover:bg-purple-200 text-purple-700 border-purple-300'
+                                            }`}
+                                            onClick={() => {
+                                                // Pick a random hidden card to show
+                                                const randomCard = hiddenCards[Math.floor(Math.random() * hiddenCards.length)];
+                                                setGhostPeekModal({ ghostId: p.id, card: randomCard });
+                                            }}
+                                        >
+                                            👁️ Peek & Shuffle
                                         </button>
                                     )}
                                 </div>
@@ -2245,8 +2719,142 @@ const App: React.FC = () => {
                     </div>
                 )}
 
+                {/* Ghost Peek Modal (Small Game Mode) */}
+                {ghostPeekModal && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                        <div className="bg-slate-800 p-6 rounded-xl max-w-sm w-full text-center">
+                            <h3 className="text-xl font-bold mb-2 text-purple-400">👻 Ghost Card Peek</h3>
+                            <p className="text-sm text-slate-400 mb-4">
+                                You peeked at one of {gameState.players.find(p => p.id === ghostPeekModal.ghostId)?.name}'s cards:
+                            </p>
+                            <div className="flex justify-center mb-4">
+                                <div className={`w-20 h-28 rounded-lg border-2 flex items-center justify-center text-3xl ${
+                                    ghostPeekModal.card.type === CardType.WITCH
+                                        ? 'border-purple-500 bg-purple-900/50'
+                                        : ghostPeekModal.card.type === CardType.CONSTABLE
+                                        ? 'border-blue-500 bg-blue-900/50'
+                                        : 'border-green-500 bg-green-900/50'
+                                }`}>
+                                    {ghostPeekModal.card.type === CardType.WITCH ? '🧙‍♀️' :
+                                     ghostPeekModal.card.type === CardType.CONSTABLE ? '⚖️' : '🏠'}
+                                </div>
+                            </div>
+                            <p className={`text-lg font-bold mb-4 ${
+                                ghostPeekModal.card.type === CardType.WITCH
+                                    ? 'text-purple-400'
+                                    : ghostPeekModal.card.type === CardType.CONSTABLE
+                                    ? 'text-blue-400'
+                                    : 'text-green-400'
+                            }`}>
+                                {ghostPeekModal.card.type === CardType.WITCH ? 'WITCH!' :
+                                 ghostPeekModal.card.type === CardType.CONSTABLE ? 'Constable' : 'Not a Witch'}
+                            </p>
+                            <p className="text-xs text-slate-500 mb-4">
+                                The ghost's hidden cards will be shuffled when you close this.
+                            </p>
+                            <Button
+                                fullWidth
+                                onClick={() => {
+                                    sendAction('SHUFFLE_GHOST', { ghostId: ghostPeekModal.ghostId });
+                                    setGhostPeekModal(null);
+                                }}
+                            >
+                                Done (Shuffle Cards)
+                            </Button>
+                        </div>
+                    </div>
+                )}
+
             </div>
         )}
+
+        {/* Night Damage Card Selection Modal (Small Game Mode) - Global overlay */}
+        {gameState.nightDamageSelection?.pendingReveal && (() => {
+            const targetPlayer = gameState.players.find(p => p.id === gameState.nightDamageSelection?.targetId);
+            const chooser = gameState.players.find(p => p.id === gameState.nightDamageSelection?.chooserId);
+            const isChooser = myPlayerId === gameState.nightDamageSelection?.chooserId;
+            const targetHiddenCards = targetPlayer?.cards.filter(c => !c.isRevealed) || [];
+
+            return (
+                <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+                    <div className="bg-slate-800 p-6 rounded-xl max-w-md w-full">
+                        <h3 className="text-xl font-bold mb-4 text-red-400">Night Attack!</h3>
+
+                        <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded-lg">
+                            <p className="text-red-300 font-medium text-center">
+                                {targetPlayer?.name} was attacked by the witches!
+                            </p>
+                        </div>
+
+                        {isChooser ? (
+                            <>
+                                <p className="text-sm text-slate-400 mb-4">
+                                    As {targetPlayer?.name}'s left neighbor, you must choose <span className="text-white font-bold">2 cards</span> to reveal.
+                                </p>
+
+                                {targetHiddenCards.length === 0 ? (
+                                    <p className="text-yellow-300 text-center">No hidden cards remain.</p>
+                                ) : (
+                                    <>
+                                        <div className="flex flex-wrap gap-2 justify-center mb-4">
+                                            {targetHiddenCards.map((card, idx) => (
+                                                <button
+                                                    key={card.id}
+                                                    onClick={() => {
+                                                        const current = nightDamageSelectedCards || [];
+                                                        if (current.includes(card.id)) {
+                                                            setNightDamageSelectedCards(current.filter(id => id !== card.id));
+                                                        } else if (current.length < 2) {
+                                                            setNightDamageSelectedCards([...current, card.id]);
+                                                        }
+                                                    }}
+                                                    className={`w-16 h-24 rounded-lg border-2 flex items-center justify-center text-3xl transition-all ${
+                                                        (nightDamageSelectedCards || []).includes(card.id)
+                                                            ? 'border-red-500 bg-red-900/50 ring-2 ring-red-400'
+                                                            : 'border-slate-600 bg-slate-700 hover:border-slate-400'
+                                                    }`}
+                                                >
+                                                    <span className="text-2xl">🂠</span>
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        <p className="text-sm text-center text-slate-400 mb-4">
+                                            Selected: {(nightDamageSelectedCards || []).length}/2 cards
+                                            {targetHiddenCards.length < 2 && (
+                                                <span className="block text-yellow-300">
+                                                    (Only {targetHiddenCards.length} hidden card(s) available)
+                                                </span>
+                                            )}
+                                        </p>
+
+                                        <Button
+                                            fullWidth
+                                            disabled={(nightDamageSelectedCards || []).length < Math.min(2, targetHiddenCards.length)}
+                                            onClick={() => {
+                                                if (nightDamageSelectedCards && nightDamageSelectedCards.length > 0) {
+                                                    sendAction('NIGHT_DAMAGE_SELECT', { cardIds: nightDamageSelectedCards });
+                                                    setNightDamageSelectedCards([]);
+                                                }
+                                            }}
+                                            className="bg-red-700 hover:bg-red-600"
+                                        >
+                                            Reveal Selected Cards
+                                        </Button>
+                                    </>
+                                )}
+                            </>
+                        ) : (
+                            <div className="text-center p-4">
+                                <p className="text-slate-300">
+                                    {chooser?.name} is choosing which cards to reveal...
+                                </p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        })()}
 
         {/* HOST CONTROLS */}
         {isHost && (
@@ -2263,7 +2871,8 @@ const App: React.FC = () => {
                      {gameState.phase !== GamePhase.DAY &&
                       gameState.phase !== GamePhase.LOBBY &&
                       gameState.phase !== GamePhase.GAME_OVER &&
-                      gameState.phase !== GamePhase.NIGHT_CONFESSION && (
+                      gameState.phase !== GamePhase.NIGHT_CONFESSION &&
+                      gameState.phase !== GamePhase.NIGHT_RESOLUTION && (
                          <Button onClick={advancePhase}>Next Phase</Button>
                      )}
                      {gameState.phase === GamePhase.GAME_OVER && (
